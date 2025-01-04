@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 // The master keeps several data structures. For each map
@@ -33,11 +36,13 @@ const TaskTypeMap TaskType = "map"
 const TaskTypeReduce TaskType = "reduce"
 
 type Task struct {
-	Id        int
-	Status    TaskStatus
-	Type      TaskType
-	Locations []string // the location of the intermediate file regions (it should always be of size R)
-	InputFile string   // the input file for the map task
+	Id                    int
+	Status                TaskStatus
+	Type                  TaskType
+	Locations             []string // the location of the intermediate file regions (it should always be of size R)
+	InputFile             string   // the input file for the map task
+	IntermediateFileNames []string
+	StartedAt             time.Time
 }
 
 type Coordinator struct {
@@ -62,13 +67,19 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	defer c.mu.Unlock()
 	for _, mapTask := range c.MapTasks {
 		if mapTask.Status == TaskStatusIdle {
+			mapTask.Status = TaskStatusInProgress
+			mapTask.StartedAt = time.Now()
 			reply.Task = *mapTask
+			reply.NReduce = c.nReduce
 			return nil
 		}
 	}
 	for _, reduceTask := range c.ReduceTasks {
 		if reduceTask.Status == TaskStatusIdle {
+			reduceTask.Status = TaskStatusInProgress
+			reduceTask.StartedAt = time.Now()
 			reply.Task = *reduceTask
+			reply.NReduce = c.nReduce
 			return nil
 		}
 	}
@@ -83,9 +94,18 @@ func (c *Coordinator) UpdateTaskStatus(args *UpdateTaskStatusArgs, reply *Update
 	// if the task is a map task, update the locations of the reduce task
 	if args.TaskType == TaskTypeMap {
 		c.MapTasks[args.TaskId].Status = args.TaskStatus
-		for i := 0; i < c.nReduce; i++ {
-			intermediateFile := fmt.Sprintf("mr-%d-%d", args.TaskId, i)
-			c.ReduceTasks[i].Locations = append(c.ReduceTasks[i].Locations, intermediateFile)
+		if args.TaskStatus == TaskStatusCompleted {
+			for _, intermediateFile := range args.IntermediateFileNames {
+				// pattern is mr-taskId-reduceId
+				// extract reduceId
+				parts := strings.Split(intermediateFile, "-")
+				lastItem := parts[len(parts)-1]
+				partition, err := strconv.Atoi(lastItem)
+				if err != nil {
+					fmt.Println("Error converting partition")
+				}
+				c.ReduceTasks[partition].Locations = append(c.ReduceTasks[partition].Locations, intermediateFile)
+			}
 		}
 		return nil
 	} else {
@@ -126,11 +146,33 @@ func (c *Coordinator) Done() bool {
 	return ret
 }
 
+func (c *Coordinator) CheckStaleTasks() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, mapTask := range c.MapTasks {
+		if mapTask.Status != TaskStatusInProgress && time.Since(mapTask.StartedAt) > 10*time.Second {
+			mapTask.Status = TaskStatusIdle
+
+		}
+	}
+	for _, reduceTask := range c.ReduceTasks {
+		if reduceTask.Status != TaskStatusCompleted && time.Since(reduceTask.StartedAt) > 10*time.Second {
+			reduceTask.Status = TaskStatusIdle
+		}
+	}
+}
+
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{nReduce: nReduce}
+	go func() {
+		for {
+			c.CheckStaleTasks()
+			time.Sleep(1 * time.Second)
+		}
+	}()
 	c.MapTasks = make([]*Task, len(files))
 	c.ReduceTasks = make([]*Task, nReduce)
 	for i := 0; i < len(files); i++ {

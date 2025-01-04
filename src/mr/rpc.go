@@ -30,13 +30,15 @@ type RequestTaskArgs struct {
 }
 
 type RequestTaskReply struct {
-	Task Task
+	Task    Task
+	NReduce int
 }
 
 type UpdateTaskStatusArgs struct {
-	TaskId     int
-	TaskType   TaskType
-	TaskStatus TaskStatus
+	TaskId                int
+	TaskType              TaskType
+	TaskStatus            TaskStatus
+	IntermediateFileNames []string
 }
 
 type UpdateTaskStatusReply struct {

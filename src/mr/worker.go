@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -15,6 +16,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -33,45 +41,67 @@ func Worker(mapf func(string, string) []KeyValue,
 	// if the task is a map task, it reads the file, calls the map function
 	// and writes the intermediate files to disk, it also emits the
 	// intermediary file paths are structured as "mr-X-Y" where X is the map task number and Y is the reduce task number
-	var task *Task = nil
-	for task == nil {
-		task = requestTask()
+	for {
+		task, nReduce := requestTask()
+		if task == nil {
+			os.Exit(1)
+		}
 		if task.Type == TaskTypeMap {
-			processMapTask(task, mapf)
+			intermediateFileNames, err := processMapTask(task, mapf, nReduce)
+			task.IntermediateFileNames = intermediateFileNames
+			if err != nil {
+				continue
+			}
 		} else {
 			processReduceTask(task, reducef)
 		}
 		updateTaskStatus(task, TaskStatusCompleted)
-		task = nil
 		time.Sleep(1 * time.Second)
 	}
 }
 
-func processMapTask(task *Task, mapf func(string, string) []KeyValue) error {
+func processMapTask(task *Task, mapf func(string, string) []KeyValue, nReduce int) ([]string, error) {
+	intermediateFileNames := make([]string, 0)
 	bytes, err := os.ReadFile(task.InputFile)
 	if err != nil {
-		return err
+		return intermediateFileNames, err
 	}
 	content := string(bytes)
 	kva := mapf(task.InputFile, content)
-	encoders := make([]*json.Encoder, len(task.Locations))
-	for i := 0; i < len(task.Locations); i++ {
-		intermediateFile := fmt.Sprintf("mr-%d-%d", task.Id, i)
-		file, err := os.Create(intermediateFile)
-		if err != nil {
-			return err
-		}
-		enc := json.NewEncoder(file)
-		encoders[i] = enc
-	}
+	tmpFiles := make([]*os.File,0)
 	for _, kv := range kva {
-		partition := ihash(kv.Key) % len(task.Locations)
-		enc := encoders[partition]
-		if err := enc.Encode(&kv); err != nil {
-			return err
+		partition := ihash(kv.Key) % nReduce
+		if partition > len(tmpFiles)-1 {
+			tmpFileName := fmt.Sprintf("mr-%d-*", task.Id)
+			tmpFile, err := os.CreateTemp("", tmpFileName)
+			if err != nil {
+				return intermediateFileNames, fmt.Errorf("failed to create temporary file: %w", err)
+			}
+			defer os.Remove(tmpFile.Name())
+			tmpFiles = append(tmpFiles, tmpFile)
 		}
+		enc := json.NewEncoder(tmpFiles[partition])
+		if err := enc.Encode(&kv); err != nil {
+			return intermediateFileNames, err
+		}
+		if err := tmpFiles[partition].Sync(); err != nil {
+			tmpFiles[partition].Close()
+			return intermediateFileNames, fmt.Errorf("failed to sync temporary file: %w", err)
+		}
+
+		// Close the file to flush the buffers
+		if err := tmpFiles[partition].Close(); err != nil {
+			return intermediateFileNames, fmt.Errorf("failed to close temporary file: %w", err)
+		}
+		intermediateFile := fmt.Sprintf("mr-%d-%d", task.Id, partition)
+		// Atomically rename the temporary file to the target filename
+		if err := os.Rename(tmpFiles[partition].Name(), intermediateFile); err != nil {
+			return intermediateFileNames, fmt.Errorf("failed to rename temporary file: %w", err)
+		}
+		intermediateFileNames = append(intermediateFileNames, intermediateFile)
 	}
-	return nil
+
+	return intermediateFileNames, nil
 }
 
 func processReduceTask(task *Task, reducef func(string, []string) string) error {
@@ -93,39 +123,51 @@ func processReduceTask(task *Task, reducef func(string, []string) string) error 
 		decoders[i] = json.NewDecoder(file)
 	}
 
-	kvMap := make(map[string][]string)
+	intermediate := make([]KeyValue, 0)
 	for _, dec := range decoders {
 		var kv KeyValue
 		if err := dec.Decode(&kv); err != nil {
 			return err
 		}
-		kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
+		intermediate = append(intermediate, kv)
 	}
-	for key, values := range kvMap {
-		result := reducef(key, values)
-		line := fmt.Sprintf("%v %v", key, result)
-		bytesWritten, err := outputFile.Write([]byte(line))
-		if err != nil || bytesWritten != len(line) {
-			return err
+
+	sort.Sort(ByKey(intermediate))
+	i := 0
+	values := make([]string, 0)
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[i].Key == intermediate[j].Key {
+			j += 1
 		}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+			result := reducef(intermediate[k].Key, values)
+			line := fmt.Sprintf("%v %v", intermediate[k].Key, result)
+			bytesWritten, err := outputFile.Write([]byte(line))
+			if err != nil || bytesWritten != len(line) {
+				return err
+			}
+		}
+
 	}
 	return nil
 
 }
 
-func requestTask() *Task {
+func requestTask() (*Task, int) {
 
 	args := RequestTaskArgs{}
 	reply := RequestTaskReply{}
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if ok {
-		return &reply.Task
+		return &reply.Task, reply.NReduce
 	}
-	return nil
+	return nil, 0
 }
 
 func updateTaskStatus(task *Task, status TaskStatus) {
-	args := UpdateTaskStatusArgs{TaskId: task.Id, TaskType: task.Type, TaskStatus: status}
+	args := UpdateTaskStatusArgs{TaskId: task.Id, TaskType: task.Type, TaskStatus: status, IntermediateFileNames: task.IntermediateFileNames}
 	reply := UpdateTaskStatusReply{}
 	call("Coordinator.UpdateTaskStatus", &args, &reply)
 }
