@@ -87,39 +87,54 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 }
 
 func (c *Coordinator) UpdateTaskStatus(args *UpdateTaskStatusArgs, reply *UpdateTaskStatusReply) error {
+	fmt.Printf("UpdateTaskStatus, args: %+v\n", *args)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// find the task
 	// update the status
 	// if the task is a map task, update the locations of the reduce task
+	log.Printf("Updating status of task:%d to: %s\n", args.TaskId, args.TaskStatus)
 	if args.TaskType == TaskTypeMap {
 		c.MapTasks[args.TaskId].Status = args.TaskStatus
 		if args.TaskStatus == TaskStatusCompleted {
 			for _, intermediateFile := range args.IntermediateFileNames {
 				// pattern is mr-taskId-reduceId
 				// extract reduceId
-				parts := strings.Split(intermediateFile, "-")
-				lastItem := parts[len(parts)-1]
-				partition, err := strconv.Atoi(lastItem)
-				if err != nil {
-					fmt.Println("Error converting partition")
+				if intermediateFile != "" {
+					parts := strings.Split(intermediateFile, "-")
+					lastItem := parts[len(parts)-1]
+					partition, err := strconv.Atoi(lastItem)
+					if err != nil {
+						fmt.Println("Error converting partition")
+					}
+					log.Printf("Locations: %+v\n", c.ReduceTasks[partition].Locations)
+					c.ReduceTasks[partition].Locations = append(c.ReduceTasks[partition].Locations, intermediateFile)
 				}
-				c.ReduceTasks[partition].Locations = append(c.ReduceTasks[partition].Locations, intermediateFile)
 			}
 		}
-		return nil
-	} else {
-		c.ReduceTasks[args.TaskId].Status = args.TaskStatus
+		reply.OK = true
 		return nil
 	}
+	c.ReduceTasks[args.TaskId].Status = args.TaskStatus
+	reply.OK = true
+	return nil
+
 }
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
-	rpc.Register(c)
+	println("Starting server")
+	if c == nil {
+		log.Fatal("Coordinator instance is nil")
+	}
+	err := rpc.Register(c)
+	if err != nil {
+		log.Fatal("RPC register error:", err)
+	}
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
+	println("Listening on ", sockname)
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
 	if e != nil {
@@ -146,20 +161,21 @@ func (c *Coordinator) Done() bool {
 	return ret
 }
 
-func (c *Coordinator) CheckStaleTasks() {
+func (c *Coordinator) CheckStaleTasks() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, mapTask := range c.MapTasks {
-		if mapTask.Status != TaskStatusInProgress && time.Since(mapTask.StartedAt) > 10*time.Second {
+		if mapTask.Status == TaskStatusInProgress && time.Since(mapTask.StartedAt) > 10*time.Second {
 			mapTask.Status = TaskStatusIdle
 
 		}
 	}
 	for _, reduceTask := range c.ReduceTasks {
-		if reduceTask.Status != TaskStatusCompleted && time.Since(reduceTask.StartedAt) > 10*time.Second {
+		if reduceTask.Status == TaskStatusInProgress && time.Since(reduceTask.StartedAt) > 10*time.Second {
 			reduceTask.Status = TaskStatusIdle
 		}
 	}
+	return nil
 }
 
 // create a Coordinator.
@@ -167,23 +183,23 @@ func (c *Coordinator) CheckStaleTasks() {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{nReduce: nReduce}
+	println("Coordinator starting, files: ", len(files), " nReduce: ", nReduce)
+	c.MapTasks = make([]*Task, 0)
+	c.ReduceTasks = make([]*Task, 0)
+	for i := 0; i < len(files); i++ {
+		c.MapTasks = append(c.MapTasks, &Task{Id: i, Status: TaskStatusIdle, Type: TaskTypeMap, InputFile: files[i]})
+	}
+	for i := 0; i < nReduce; i++ {
+		c.ReduceTasks = append(c.ReduceTasks, &Task{Id: i, Status: TaskStatusIdle, Type: TaskTypeReduce})
+	}
+	log.Printf("Starting Map Reduce job with %d map tasks and %d reduce tasks\n", len(c.MapTasks), len(c.ReduceTasks))
+	c.server()
 	go func() {
 		for {
 			c.CheckStaleTasks()
 			time.Sleep(1 * time.Second)
 		}
 	}()
-	c.MapTasks = make([]*Task, len(files))
-	c.ReduceTasks = make([]*Task, nReduce)
-	for i := 0; i < len(files); i++ {
-		c.MapTasks = append(c.MapTasks, &Task{Id: i, Status: TaskStatusIdle, Type: TaskTypeMap, InputFile: files[i]})
-		i++
-	}
-	for i := 0; i < nReduce; i++ {
-		c.ReduceTasks = append(c.ReduceTasks, &Task{Id: i, Status: TaskStatusIdle, Type: TaskTypeReduce})
-		i++
-	}
-
-	c.server()
+	println("Coordinator started")
 	return &c
 }

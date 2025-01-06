@@ -27,6 +27,7 @@ type ExampleReply struct {
 // Add your RPC definitions here.
 
 type RequestTaskArgs struct {
+	WorkerId string
 }
 
 type RequestTaskReply struct {
@@ -42,6 +43,7 @@ type UpdateTaskStatusArgs struct {
 }
 
 type UpdateTaskStatusReply struct {
+	OK bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
