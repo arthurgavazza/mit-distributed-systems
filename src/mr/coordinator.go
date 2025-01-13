@@ -46,10 +46,12 @@ type Task struct {
 }
 
 type Coordinator struct {
-	nReduce     int
-	MapTasks    []*Task
-	ReduceTasks []*Task
-	mu          sync.Mutex
+	nReduce              int
+	completedMapTasks    int
+	completedReduceTasks int
+	MapTasks             []*Task
+	ReduceTasks          []*Task
+	mu                   sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -74,6 +76,9 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 			return nil
 		}
 	}
+	if c.completedMapTasks < len(c.MapTasks) {
+		return nil
+	}
 	for _, reduceTask := range c.ReduceTasks {
 		if reduceTask.Status == TaskStatusIdle {
 			reduceTask.Status = TaskStatusInProgress
@@ -87,19 +92,14 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 }
 
 func (c *Coordinator) UpdateTaskStatus(args *UpdateTaskStatusArgs, reply *UpdateTaskStatusReply) error {
-	fmt.Printf("UpdateTaskStatus, args: %+v\n", *args)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// find the task
-	// update the status
-	// if the task is a map task, update the locations of the reduce task
-	log.Printf("Updating status of task:%d to: %s\n", args.TaskId, args.TaskStatus)
+
 	if args.TaskType == TaskTypeMap {
 		c.MapTasks[args.TaskId].Status = args.TaskStatus
 		if args.TaskStatus == TaskStatusCompleted {
+			c.completedMapTasks++
 			for _, intermediateFile := range args.IntermediateFileNames {
-				// pattern is mr-taskId-reduceId
-				// extract reduceId
 				if intermediateFile != "" {
 					parts := strings.Split(intermediateFile, "-")
 					lastItem := parts[len(parts)-1]
@@ -107,16 +107,16 @@ func (c *Coordinator) UpdateTaskStatus(args *UpdateTaskStatusArgs, reply *Update
 					if err != nil {
 						fmt.Println("Error converting partition")
 					}
-					log.Printf("Locations: %+v\n", c.ReduceTasks[partition].Locations)
 					c.ReduceTasks[partition].Locations = append(c.ReduceTasks[partition].Locations, intermediateFile)
 				}
 			}
 		}
-		reply.OK = true
 		return nil
 	}
 	c.ReduceTasks[args.TaskId].Status = args.TaskStatus
-	reply.OK = true
+	if args.TaskStatus == TaskStatusCompleted {
+		c.completedReduceTasks++
+	}
 	return nil
 
 }
@@ -146,19 +146,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-	for _, mapTask := range c.MapTasks {
-		if mapTask.Status != TaskStatusCompleted {
-			return ret
-		}
-	}
-	for _, reduceTask := range c.ReduceTasks {
-		if reduceTask.Status != TaskStatusCompleted {
-			return ret
-		}
-	}
-	ret = true
-	return ret
+	return c.completedMapTasks == len(c.MapTasks) && c.completedReduceTasks == len(c.ReduceTasks)
 }
 
 func (c *Coordinator) CheckStaleTasks() error {

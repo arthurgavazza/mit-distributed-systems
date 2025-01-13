@@ -43,7 +43,6 @@ type UpdateTaskStatusArgs struct {
 }
 
 type UpdateTaskStatusReply struct {
-	OK bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
