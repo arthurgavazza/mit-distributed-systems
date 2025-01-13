@@ -53,8 +53,9 @@ func Worker(mapf func(string, string) []KeyValue,
 	// intermediary file paths are structured as "mr-X-Y" where X is the map task number and Y is the reduce task number
 	for {
 		task, nReduce := requestTask(workerId)
-		if task == nil {
-			os.Exit(1)
+		if task == nil || task.Status == "" {
+			time.Sleep(2 * time.Second)
+			continue
 		}
 		if task.Type == TaskTypeMap {
 			intermediateFileNamesMap, err := processMapTask(task, mapf, nReduce)
@@ -62,21 +63,19 @@ func Worker(mapf func(string, string) []KeyValue,
 			for _, v := range intermediateFileNamesMap {
 				intermediateFileNames = append(intermediateFileNames, v)
 			}
-
 			task.IntermediateFileNames = intermediateFileNames
 			if err != nil {
 				log.Fatalf("failed to process map task: %v", err)
 			}
-		} else {
+		} else if task.Type == TaskTypeReduce {
 			processReduceTask(task, reducef)
 		}
 		updateTaskStatus(task, TaskStatusCompleted)
-		time.Sleep(1 * time.Second)
+
 	}
 }
 
 func processMapTask(task *Task, mapf func(string, string) []KeyValue, nReduce int) (map[int]string, error) {
-	println("Processing map task")
 	intermediateFileNames := make(map[int]string, 0)
 	bytes, err := os.ReadFile(task.InputFile)
 	if err != nil {
@@ -84,23 +83,18 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue, nReduce in
 	}
 	content := string(bytes)
 	kva := mapf(task.InputFile, content)
-	println("Kva: ", len(kva))
 	tmpFiles := make([]*os.File, nReduce)
 	for _, kv := range kva {
 		partition := ihash(kv.Key) % nReduce
 		if tmpFiles[partition] == nil {
-			tmpFileName := fmt.Sprintf("mr-%d-*", task.Id)
+			tmpFileName := fmt.Sprintf("mr-%d-*", partition)
 			tmpFile, err := os.CreateTemp("", tmpFileName)
 			if err != nil {
 				log.Fatalf("failed to create tmp file: %v", err)
 			}
-			defer tmpFile.Close()
-			defer os.Remove(tmpFile.Name())
 			tmpFiles[partition] = tmpFile
 		}
 
-		println("Partition: ", partition)
-		println("TmpFiles: ", len(tmpFiles))
 		enc := json.NewEncoder(tmpFiles[partition])
 		if tmpFiles[partition] == nil {
 			log.Fatalf("tmpFiles[%d] is nil", partition)
@@ -108,8 +102,7 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue, nReduce in
 		if err := enc.Encode(&kv); err != nil {
 			log.Fatalf("failed to encode key value: %v", err)
 		}
-
-		intermediateFile := fmt.Sprintf("mr-output/intermediate/mr-%d-%d", task.Id, partition)
+		intermediateFile := fmt.Sprintf("intermediate/mr-%d-%d", task.Id, partition)
 		intermediateFileNames[partition] = intermediateFile
 	}
 
@@ -127,42 +120,37 @@ func processMapTask(task *Task, mapf func(string, string) []KeyValue, nReduce in
 			if err := os.Rename(tmpFile.Name(), intermediateFileNames[idx]); err != nil {
 				return intermediateFileNames, fmt.Errorf("failed to rename temporary file: %w", err)
 			}
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
 		}
 
 	}
-	log.Printf("Intermediate file names: %v", intermediateFileNames)
 	return intermediateFileNames, nil
 }
 
 func processReduceTask(task *Task, reducef func(string, []string) string) error {
-	println("Processing reduce task")
-	// read each of the intermediate files associated to this task
-	// group the values by key
-	// call the reduce function for each key and it's associated values
-	outputFilePath := fmt.Sprintf("mr-output/final/mr-out-%d", task.Id)
-	dir := filepath.Dir(outputFilePath)
-	if err := EnsureDir(dir); err != nil {
-		return fmt.Errorf("failed to ensure directory: %w", err)
-	}
+	outputFilePath := fmt.Sprintf("mr-out-%d", task.Id)
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
 		return err
 	}
 	defer outputFile.Close()
-	log.Println("Reading from Locations: ", task.Locations)
 	intermediate, err := readIntermediateFiles(task.Locations)
 	if err != nil {
 		log.Fatalf("failed to read intermediate files: %v", err)
 	}
 	sort.Sort(ByKey(intermediate))
-	values := make([]string, 0)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
 		for j < len(intermediate) && intermediate[i].Key == intermediate[j].Key {
 			j += 1
 		}
-
+		values := make([]string, 0)
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
@@ -172,7 +160,7 @@ func processReduceTask(task *Task, reducef func(string, []string) string) error 
 		if err != nil || bytesWritten != len(line) {
 			return err
 		}
-		i = j + 1
+		i = j
 
 	}
 	return nil
@@ -199,7 +187,6 @@ func readIntermediateFiles(fileNames []string) ([]KeyValue, error) {
 			log.Fatalf("failed to scan file: %v", scanner.Err())
 		}
 	}
-	log.Printf("Found %d kv pairs to reduce", len(intermediateFileContent))
 	return intermediateFileContent, nil
 
 }
